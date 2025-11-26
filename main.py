@@ -5,23 +5,30 @@ from PIL import Image
 import io
 import json
 from openai import OpenAI
-
 from dotenv import load_dotenv
 import os
-
-
+import datetime
 
 # -----------------------------------------
 # 🔑 OPENAI CLIENT
 # -----------------------------------------
-
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Log container (global)
+LOGS = []
+
+def log(msg: str):
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    LOGS.append(f"[{timestamp}] {msg}")
+    print(msg)
+
 
 # ============================================
 # 🧠 Tesseract Path
 # ============================================
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 
 # ============================================
 # ⚙️ Streamlit App
@@ -29,19 +36,24 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 st.set_page_config(page_title="PCB RFQ Auto-Fill (GPT-4o)", layout="wide")
 st.title("📄 PCB RFQ Auto-Fill using GPT-4o + OCR")
 
+
 uploaded_file = st.file_uploader("Upload PCB RFQ PDF", type=["pdf"])
+
 
 # ============================================
 # 📘 PDF → Images
 # ============================================
 def pdf_to_images(pdf_bytes, dpi=300):
+    log("Converting PDF pages to images...")
     pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
     images = []
-    for page in pdf:
+    for idx, page in enumerate(pdf):
         pix = page.get_pixmap(dpi=dpi)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         images.append(img)
+        log(f"Converted page {idx+1}")
     return images
+
 
 # ============================================
 # 🔄 Auto-Rotate
@@ -50,24 +62,29 @@ def auto_rotate(image):
     try:
         osd = pytesseract.image_to_osd(image)
         angle = int(osd.split("Rotate:")[1].split("\n")[0].strip())
+        log(f"Auto-rotation detected: {angle}°")
         return image.rotate(-angle, expand=True)
-    except:
+    except Exception as e:
+        log(f"No rotation needed or error: {e}")
         return image
+
 
 # ============================================
 # 📝 OCR Extraction
 # ============================================
 def extract_text(images):
     text = ""
+    log("Starting OCR for all pages...")
     for idx, img in enumerate(images):
         rotated = auto_rotate(img)
         ocr_text = pytesseract.image_to_string(rotated)
+        log(f"OCR completed for page {idx+1}, length={len(ocr_text)} chars")
         text += f"\n\n===== PAGE {idx+1} =====\n{ocr_text}"
     return text
 
 
 # ============================================
-# 🤖 GPT-4o Field Mapping
+# 🤖 GPT-4o Field Mapping + Token Logs
 # ============================================
 def gpt40_map_fields(extracted_text):
 
@@ -133,13 +150,19 @@ Here is the extracted text:
 Only return VALID JSON. No explanation.
 """
 
+    log(f"GPT prompt length: {len(prompt)} characters")
+
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"}
     )
 
-    return json.loads(response.choices[0].message.content)
+    # Token usage logging
+    usage = response.usage
+    log(f"Tokens → Prompt: {usage.prompt_tokens}, Completion: {usage.completion_tokens}, Total: {usage.total_tokens}")
+
+    return json.loads(response.choices[0].message.content), usage
 
 
 # ============================================
@@ -147,26 +170,22 @@ Only return VALID JSON. No explanation.
 # ============================================
 if uploaded_file and st.button("Extract & Auto-Fill RFQ"):
 
-    st.info("⏳ Running OCR…")
-
     pdf_bytes = uploaded_file.read()
     images = pdf_to_images(pdf_bytes)
+
     extracted_text = extract_text(images)
 
     with st.expander("📘 Extracted Text"):
         st.text(extracted_text)
 
     st.info("🤖 Mapping fields using GPT-4o…")
-
-    mapped = gpt40_map_fields(extracted_text)
+    mapped, usage = gpt40_map_fields(extracted_text)
 
     st.success("🎉 GPT-4o Successfully Mapped RFQ Fields!")
 
     st.subheader("📝 Auto-Filled RFQ Form (Editable)")
 
     final_output = {}
-
-    # Split keys for two column UI
     keys = list(mapped.keys())
     left_keys = keys[:10]
     right_keys = keys[10:]
@@ -187,3 +206,43 @@ if uploaded_file and st.button("Extract & Auto-Fill RFQ"):
 
     st.subheader("📤 Final JSON Output")
     st.json(final_output)
+
+    # ============================
+    # 📊 TOKEN USAGE UI
+    # ============================
+    st.subheader("📊 GPT Token Usage")
+    st.metric("Prompt Tokens", usage.prompt_tokens)
+    st.metric("Completion Tokens", usage.completion_tokens)
+    st.metric("Total Tokens", usage.total_tokens)
+
+    # ============================
+    # 💰 COST CALCULATION (USD ONLY)
+    # ============================
+
+    # GPT-4o pricing:
+    # Prompt: $5 per 1M tokens
+    # Completion: $15 per 1M tokens
+
+    prompt_cost_usd = (usage.prompt_tokens / 1_000_000) * 5
+    completion_cost_usd = (usage.completion_tokens / 1_000_000) * 15
+    total_cost_usd = prompt_cost_usd + completion_cost_usd
+
+    st.subheader("💰 Cost Per Request (USD Only)")
+
+    colC1, colC2, colC3 = st.columns(3)
+
+    with colC1:
+        st.metric("Prompt Cost (USD)", f"${prompt_cost_usd:.6f}")
+
+    with colC2:
+        st.metric("Completion Cost (USD)", f"${completion_cost_usd:.6f}")
+
+    with colC3:
+        st.metric("Total Cost (USD)", f"${total_cost_usd:.6f}")
+
+    # ============================
+    # 📜 LOGS
+    # ============================
+    with st.expander("📜 Logs (OCR + GPT + Debug)"):
+        for L in LOGS:
+            st.text(L)
